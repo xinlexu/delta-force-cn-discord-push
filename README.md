@@ -7,11 +7,13 @@
 - 不需要 Discord Bot Token，只使用绑定到目标频道的 Webhook。
 - 不需要电脑或本地脚本长期在线，由 GitHub Actions 定时运行。
 - 首次启动只建立基线，不会一次性发送历史公告。
-- 通过 `state.json` 去重；同一公告不会重复发送。
+- 通过 `state.json` 去重；仅在 Discord 返回消息创建确认后记录发送成功。极端网络或提交失败下仍可能重复，见文末说明。
 - 默认过滤纯赛事、战队和赛程资讯。
 - 直接读取官网当前使用的腾讯 Milo 动态新闻接口，并自动发现当前流程参数。
 - 每次最多扫描 60 条，自动分页；接口异常、空数据或陈旧数据会让任务失败，不会把旧静态快照当成成功。
-- GitHub Actions 会先运行 20 项单元测试，再接触 Webhook Secret。
+- GitHub Actions 会先运行 28 项单元测试，再接触 Webhook Secret。
+- `dry_run` 只验证官网抓取和分类，不读取 Webhook Secret、不发送消息、不修改状态。
+- 排队任务开始时读取分支最新去重状态；`normal` 仅允许在默认分支运行。
 - Actions 固定到完整提交，Ubuntu 依赖使用 SHA-256 哈希锁定；Windows 本地依赖也固定版本。
 
 ## 1. Discord：只创建一个频道和一个 Webhook
@@ -43,6 +45,8 @@
 
 ## 5. 第一次测试
 
+可以先选择 `dry_run`，确认日志显示官网条目和分类；该模式不需要 Secret，也不向 Discord 发消息。
+
 1. 打开仓库的 **Actions**。
 2. 选择 **Delta Force CN Discord Push**。
 3. 点击 **Run workflow**。
@@ -53,7 +57,11 @@
 
 再次手动运行，`mode` 改为 `normal`。
 
-频道会收到“监控已启用”。程序会把当前官网条目写入 `state.json`，但不发送旧公告。以后工作流大约每 15 分钟检查一次，只发新内容。GitHub 定时任务可能偶尔延迟。
+频道会收到“监控已启用”。程序在 Discord 确认该消息创建成功后，把当前官网条目写入 `state.json`，不补发旧公告。已经初始化的仓库直接继续使用现有状态，不要重置。
+
+工作流配置为每小时 07、22、37、52 分检查，但这不是 15 分钟送达保证。2026-10-22 检查到最近 15 次定时运行实际相隔约 2–6 小时；当前仓库的实际频率未达到目标。GitHub 官方说明高负载下定时事件可能延迟甚至丢弃。若要求稳定约 15 分钟，需另行选择可靠的外部调度器或常驻运行环境，不能只靠修改 cron 宣称解决。
+
+参考：[GitHub 定时事件限制](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)。公开仓库长期无活动也可能停用 schedule；项目每月会保存一次状态保活，但仍应检查实际运行记录。
 
 从旧版静态源升级时，`source_version` 变化会自动重新建立一次基线，避免把几十条历史文章当成新内容刷屏。
 
@@ -66,6 +74,8 @@ Actions → Run workflow → `mode: resend_latest`。
 ## 默认会推送什么
 
 会推送：更新、维护、修复、平衡调整、补偿、版本、新赛季、福利、免费领取、联动/联名、返场、签到、三角券、兑换、预告、招募、测试服、共创活动和重要公告等。
+
+同一标题同时包含更新和活动关键词时，优先标为“更新公告”；赛事福利仍保留。
 
 默认忽略：纯职业联赛、主播巅峰赛、赛程、战队、俱乐部等赛事新闻。可在 `config.json` 修改关键词。
 
@@ -84,3 +94,6 @@ Actions → Run workflow → `mode: resend_latest`。
 不要把 Discord Webhook URL 写入 `config.json`、README、Issue、Actions 日志或任何公开提交。程序会主动隐藏异常中的 Webhook URL，但 Secret 仍应只在 GitHub 设置页粘贴。若泄露，在 Discord 的 Webhook 设置中删除旧 Webhook，再创建新的并更新 Secret。
 
 Discord Webhook 与 Git 提交无法组成真正的事务。极少数情况下，如果 Discord 已收消息但 `state.json` 最终提交失败，下一轮可能重复一次；Actions 会明确标红，需及时处理失败记录。
+
+网络超时也可能发生在 Discord 已接受消息之后，重试无法保证绝对只发送一次。程序强制 `wait=true` 并校验返回的消息和频道 ID，避免把没有创建确认的 HTTP 成功当成送达；不会把这些 ID 或密钥打印到日志。参考：[Discord Webhook 官方说明](https://docs.discord.com/developers/resources/webhook#execute-webhook)。
+

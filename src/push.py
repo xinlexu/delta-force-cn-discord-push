@@ -789,10 +789,10 @@ def classify_article(article: Article, config: dict[str, Any]) -> tuple[bool, st
     esports_override = contains_any(title, config.get("esports_override_keywords", []))
     if esports and not esports_override:
         return False, "赛事"
-    if contains_any(title, config.get("event_keywords", [])):
-        return True, "活动资讯"
     if contains_any(title, config.get("update_keywords", [])):
         return True, "更新公告"
+    if contains_any(title, config.get("event_keywords", [])):
+        return True, "活动资讯"
     if contains_any(title, config.get("announcement_keywords", [])):
         return True, "官方公告"
     if article.category == "公告":
@@ -803,10 +803,11 @@ def classify_article(article: Article, config: dict[str, Any]) -> tuple[bool, st
 
 
 def webhook_wait_url(webhook_url: str) -> str:
-    separator = "&" if "?" in webhook_url else "?"
-    if re.search(r"(?:\?|&)wait=", webhook_url):
-        return webhook_url
-    return webhook_url + separator + "wait=true"
+    parsed = urlparse(webhook_url)
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    # An explicitly supplied wait=false must not bypass delivery confirmation.
+    query["wait"] = ["true"]
+    return urlunparse(parsed._replace(query=urlencode(query, doseq=True), fragment=""))
 
 
 WEBHOOK_SECRET_RE = re.compile(
@@ -834,7 +835,7 @@ def send_webhook(webhook_url: str, payload: dict[str, Any]) -> None:
     last_error = ""
     for attempt in range(1, 4):
         try:
-            response = requests.post(url, json=payload, timeout=35)
+            response = requests.post(url, json=payload, timeout=35, allow_redirects=False)
         except requests.RequestException as exc:
             # requests exceptions often include the full request URL. Never put
             # that value in Actions logs because the URL itself is the secret.
@@ -845,12 +846,24 @@ def send_webhook(webhook_url: str, payload: dict[str, Any]) -> None:
             break
 
         if response.status_code in {200, 204}:
+            try:
+                receipt = response.json()
+            except ValueError:
+                receipt = None
+            if (
+                response.status_code != 200
+                or not isinstance(receipt, dict)
+                or not str(receipt.get("id", "")).isdigit()
+                or not str(receipt.get("channel_id", "")).isdigit()
+            ):
+                raise RuntimeError("Discord 未返回消息创建确认；未保存为已发送")
+            LOGGER.info("Discord 已确认消息创建")
             return
         if response.status_code == 429:
             retry_after = 1.5
             try:
                 retry_after = float(response.json().get("retry_after", retry_after))
-            except (ValueError, TypeError, json.JSONDecodeError):
+            except (AttributeError, ValueError, TypeError, json.JSONDecodeError):
                 for header_name in ("Retry-After", "X-RateLimit-Reset-After"):
                     raw_retry_after = response.headers.get(header_name)
                     if raw_retry_after is None:
@@ -978,12 +991,6 @@ def run_normal(
 
     if not bool(state.get("initialized")) or source_changed:
         was_initialized = bool(state.get("initialized"))
-        state["version"] = 2
-        state["initialized"] = True
-        state["source_version"] = source_version
-        state["seen"] = list(dict.fromkeys(current_ids + seen_list))[:1000]
-        state["last_keepalive_month"] = datetime.now(BEIJING).strftime("%Y-%m")
-        save_state(state)
         latest = articles[0]
         if was_initialized and source_changed:
             title = "🔄 三角洲行动国服监控数据源已升级"
@@ -997,6 +1004,13 @@ def run_normal(
             "以后仅推送新出现的更新、活动和重要公告。"
         )
         send_webhook(webhook_url, status_payload(title, description))
+        # A failed startup message must remain retryable on the next run.
+        state["version"] = 2
+        state["initialized"] = True
+        state["source_version"] = source_version
+        state["seen"] = list(dict.fromkeys(seen_list + list(reversed(current_ids))))[-1000:]
+        state["last_keepalive_month"] = datetime.now(BEIJING).strftime("%Y-%m")
+        save_state(state)
         return
 
     new_articles = [article for article in articles if article.article_id not in seen]
@@ -1053,9 +1067,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--mode",
-        choices=("normal", "test", "resend_latest"),
+        choices=("normal", "test", "resend_latest", "dry_run"),
         default=os.environ.get("MODE", "normal"),
-        help="normal=正常监控；test=连通性测试；resend_latest=重发最新匹配条目",
+        help="normal=正常监控；test=连通性测试；resend_latest=重发最新匹配条目；dry_run=只检查官网",
     )
     return parser.parse_args()
 
@@ -1078,12 +1092,20 @@ def main() -> int:
             "last_keepalive_month": "",
         },
     )
-    webhook_url = require_webhook()
+    webhook_url = "" if args.mode == "dry_run" else require_webhook()
     jina_api_key = os.environ.get("JINA_API_KEY", "").strip()
     articles = fetch_articles(config, jina_api_key)
     LOGGER.info("解析到 %s 个官网条目", len(articles))
 
-    if args.mode == "test":
+    if args.mode == "dry_run":
+        seen = {str(value) for value in state.get("seen", [])}
+        pending = [article for article in articles if article.article_id not in seen]
+        LOGGER.info("只读检查：%s 个未处理条目；不发送消息、不修改状态", len(pending))
+        for article in articles[:5]:
+            should_push, category = classify_article(article, config)
+            LOGGER.info("%s | %s | %s | %s", article.published, category,
+                        "匹配" if should_push else "过滤", article.title)
+    elif args.mode == "test":
         run_test(webhook_url, articles, config)
     elif args.mode == "resend_latest":
         latest = next(
@@ -1107,3 +1129,4 @@ if __name__ == "__main__":
     except Exception as exc:  # noqa: BLE001 - top-level job should fail loudly
         LOGGER.error("任务失败：%s", exc)
         raise SystemExit(1)
+

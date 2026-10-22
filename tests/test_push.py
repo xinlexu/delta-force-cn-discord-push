@@ -263,7 +263,7 @@ class RuntimeTests(unittest.TestCase):
 
     def test_webhook_honors_retry_after(self):
         limited = self.response({"retry_after": 2.5}, status=429)
-        accepted = self.response({}, status=204)
+        accepted = self.response({"id": "123", "channel_id": "456"})
         with (
             mock.patch.object(push.requests, "post", side_effect=[limited, accepted]),
             mock.patch.object(push.time, "sleep") as sleeper,
@@ -277,7 +277,7 @@ class RuntimeTests(unittest.TestCase):
         limited = self.response("not-json", status=429)
         limited._content = b"not-json"
         limited.headers["X-RateLimit-Reset-After"] = "9.0"
-        accepted = self.response({}, status=204)
+        accepted = self.response({"id": "123", "channel_id": "456"})
         with (
             mock.patch.object(push.requests, "post", side_effect=[limited, accepted]),
             mock.patch.object(push.time, "sleep") as sleeper,
@@ -320,6 +320,69 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn("new-1", saved["seen"])
         sender.assert_called_once()
 
+    def test_update_with_event_reward_is_still_an_update(self):
+        article = push.Article("1", "10月22日更新公告丨商店活动开启", "https://df.qq.com/x")
+        self.assertEqual(push.classify_article(article, self.config), (True, "更新公告"))
+
+    def test_esports_reward_is_not_filtered(self):
+        article = push.Article("1", "观看职业联赛免费领取三角券", "https://df.qq.com/x", category="赛事")
+        self.assertEqual(push.classify_article(article, self.config), (True, "活动资讯"))
+
+    def test_wait_false_is_overridden_and_duplicate_wait_removed(self):
+        url = "https://discord.com/api/webhooks/123/token?wait=false&wait=false"
+        self.assertEqual(push.parse_qs(push.urlparse(push.webhook_wait_url(url)).query), {"wait": ["true"]})
+
+    def test_unconfirmed_success_is_not_marked_delivered(self):
+        for response in (self.response({}, 204), self.response({}), self.response([])):
+            with self.subTest(status=response.status_code), mock.patch.object(
+                push.requests, "post", return_value=response
+            ) as post, self.assertRaisesRegex(RuntimeError, "确认"):
+                push.send_webhook("https://discord.com/api/webhooks/123/token", {"content": "test"})
+            self.assertEqual(post.call_count, 1)
+
+    def test_failed_initialization_does_not_save_baseline(self):
+        state = {"initialized": False, "seen": []}
+        before = json.loads(json.dumps(state))
+        with mock.patch.object(push, "send_webhook", side_effect=RuntimeError("failed")), mock.patch.object(
+            push, "save_state"
+        ) as saver, self.assertRaisesRegex(RuntimeError, "failed"):
+            push.run_normal("webhook", [push.Article("1", "更新公告", "https://df.qq.com/x")], self.config, state)
+        saver.assert_not_called()
+        self.assertEqual(state, before)
+
+    def test_partial_failure_only_saves_confirmed_items_and_retries_failed(self):
+        articles = [push.Article(str(i), "更新公告", f"https://df.qq.com/x?id={i}") for i in (3, 2, 1)]
+        state = {"initialized": True, "source_version": "milo-v1", "seen": []}
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(
+            push, "STATE_PATH", Path(temp_dir) / "state.json"
+        ), mock.patch.object(push, "send_webhook", side_effect=[None, RuntimeError("failed"), None]), self.assertRaises(RuntimeError):
+            push.run_normal("webhook", articles, self.config, state)
+        self.assertEqual(state["seen"], ["1", "3"])
+        with mock.patch.object(push, "send_webhook") as sender, mock.patch.object(push, "save_state"):
+            push.run_normal("webhook", articles, self.config, state)
+        sender.assert_called_once()
+        self.assertIn("2", state["seen"])
+
+    def test_push_cap_keeps_overflow_unseen(self):
+        articles = [push.Article(str(i), "更新公告", f"https://df.qq.com/x?id={i}") for i in range(10, 0, -1)]
+        state = {"initialized": True, "source_version": "milo-v1", "seen": []}
+        with mock.patch.object(push, "send_webhook") as sender, mock.patch.object(push, "save_state"):
+            push.run_normal("webhook", articles, self.config, state)
+        self.assertEqual(sender.call_count, 8)
+        self.assertEqual(state["seen"], [str(i) for i in range(1, 9)])
+
+    def test_dry_run_never_requires_secret_sends_or_saves(self):
+        article = push.Article("1", "更新公告", "https://df.qq.com/x", published="2026-10-22")
+        with mock.patch.object(sys, "argv", ["push.py", "--mode", "dry_run"]), mock.patch.object(
+            push, "fetch_articles", return_value=[article]
+        ), mock.patch.object(push, "require_webhook") as secret, mock.patch.object(
+            push, "send_webhook"
+        ) as sender, mock.patch.object(push, "save_state") as saver:
+            self.assertEqual(push.main(), 0)
+        secret.assert_not_called()
+        sender.assert_not_called()
+        saver.assert_not_called()
+
     def test_runtime_budget_defers_unsent_items(self):
         articles = [
             push.Article(
@@ -356,3 +419,4 @@ class RuntimeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

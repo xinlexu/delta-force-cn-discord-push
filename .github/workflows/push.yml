@@ -12,6 +12,7 @@ on:
         default: test
         type: choice
         options:
+          - dry_run
           - test
           - normal
           - resend_latest
@@ -25,6 +26,8 @@ concurrency:
 
 jobs:
   push:
+    # Only the default branch may advance production de-duplication state.
+    if: github.ref_name == github.event.repository.default_branch || inputs.mode == 'dry_run' || inputs.mode == 'test'
     runs-on: ubuntu-latest
     timeout-minutes: 12
 
@@ -33,6 +36,8 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+          # A queued run must read state committed by the previous run.
+          ref: ${{ github.ref_name }}
 
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
@@ -50,13 +55,14 @@ jobs:
         run: python -m unittest discover -s tests -v
 
       - name: Fetch official news and push to Discord
+        id: notify
         env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_WEBHOOK_URL: ${{ inputs.mode != 'dry_run' && secrets.DISCORD_WEBHOOK_URL || '' }}
           MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'normal' }}
         run: python src/push.py --mode "$MODE"
 
       - name: Persist de-duplication state
-        if: always()
+        if: always() && steps.notify.outcome != 'skipped' && (github.event_name == 'schedule' || inputs.mode == 'normal')
         shell: bash
         env:
           STATE_PUSH_TOKEN: ${{ github.token }}
@@ -74,8 +80,13 @@ jobs:
               exit 0
             fi
             if [ "$attempt" -lt 3 ]; then
+              # Rebase over concurrent code edits. Conflicting state changes
+              # stop the job; never force-push or discard delivery records.
+              git fetch "https://x-access-token:${STATE_PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$GITHUB_REF_NAME"
+              git rebase FETCH_HEAD
               sleep $((attempt * 2))
             fi
           done
           echo "state.json push failed after 3 attempts" >&2
           exit 1
+
